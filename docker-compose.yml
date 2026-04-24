@@ -66,6 +66,48 @@ services:
       - "--replication-factor"
       - "1"
 
+  clickhouse-setup:
+    image: clickhouse/clickhouse-server:24.3
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        clickhouse-client --host clickhouse --port 9000 --multiline --query "
+          CREATE TABLE IF NOT EXISTS movie_events_queue (
+              event_id  String,
+              user_id   String,
+              movie_id  String,
+              event_type String,
+              timestamp String,
+              device_type String,
+              session_id String,
+              progress_seconds Nullable(Int32)
+          ) ENGINE = Kafka
+          SETTINGS
+              kafka_broker_list = 'kafka:9092',
+              kafka_topic_list  = 'movie-events',
+              kafka_group_name  = 'clickhouse-consumer',
+              kafka_format      = 'JSONEachRow',
+              kafka_num_consumers = 1;
+          CREATE MATERIALIZED VIEW IF NOT EXISTS movie_events_mv TO movie_events AS
+          SELECT
+              event_id,
+              user_id,
+              movie_id,
+              event_type,
+              parseDateTimeBestEffort(timestamp) AS timestamp,
+              device_type,
+              session_id,
+              progress_seconds
+          FROM movie_events_queue;
+        "
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     ports:
@@ -99,6 +141,40 @@ services:
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: cinema
+      POSTGRES_PASSWORD: cinema
+      POSTGRES_DB: cinema
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cinema -d cinema"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  aggregation-service:
+    build: ./aggregation_service
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      DATABASE_URL: postgresql://cinema:cinema@postgres:5432/cinema
+      AGGREGATION_INTERVAL_SECONDS: "300"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
       timeout: 5s
       retries: 10
